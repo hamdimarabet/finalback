@@ -204,6 +204,64 @@ def normalize_loyalty_language(language: str | None) -> str:
 
     return "ar"
 
+
+def translate_loyalty_level(
+    level_name: str | None,
+    language: str,
+) -> str | None:
+    if level_name is None:
+        return None
+
+    language = normalize_loyalty_language(language)
+
+    translations = {
+        "Bronze": {"en": "Bronze", "fr": "Bronze", "ar": "برونزي"},
+        "Silver": {"en": "Silver", "fr": "Argent", "ar": "فضي"},
+        "Gold": {"en": "Gold", "fr": "Or", "ar": "ذهبي"},
+        "Platinum": {"en": "Platinum", "fr": "Platine", "ar": "بلاتيني"},
+    }
+
+    return translations.get(level_name, {}).get(language, level_name)
+
+
+def translate_weight_status(
+    status: str | None,
+    language: str,
+) -> str | None:
+    if status is None:
+        return None
+
+    language = normalize_loyalty_language(language)
+
+    translations = {
+        "missing_data": {"en": "Missing data", "fr": "Données manquantes", "ar": "بيانات غير مكتملة"},
+        "completed": {"en": "Goal reached", "fr": "Objectif atteint", "ar": "تم تحقيق الهدف"},
+        "started": {"en": "Getting started", "fr": "Début du parcours", "ar": "بداية المسار"},
+        "almost_there": {"en": "Almost there", "fr": "Presque atteint", "ar": "اقتربت من الهدف"},
+        "in_progress": {"en": "In progress", "fr": "En cours", "ar": "قيد التقدم"},
+    }
+
+    return translations.get(status, {}).get(language, status)
+
+
+def translate_weight_trend(
+    trend: str | None,
+    language: str,
+) -> str | None:
+    if trend is None:
+        return None
+
+    language = normalize_loyalty_language(language)
+
+    translations = {
+        "possible_loss": {"en": "Possible weight loss", "fr": "Perte de poids possible", "ar": "احتمال فقدان الوزن"},
+        "possible_gain": {"en": "Possible weight gain", "fr": "Prise de poids possible", "ar": "احتمال زيادة الوزن"},
+        "stable": {"en": "Stable", "fr": "Stable", "ar": "مستقر"},
+        "unknown": {"en": "Unknown", "fr": "Inconnu", "ar": "غير معروف"},
+    }
+
+    return translations.get(trend, {}).get(language, trend)
+
 def build_loyalty_message_text(
     language: str,
     product_name: str,
@@ -219,6 +277,19 @@ def build_loyalty_message_text(
     level_after_purchase = after.get("current_level")
 
     next_level_after = after.get("next_level")
+
+    current_level_text = translate_loyalty_level(
+        current_level,
+        language,
+    )
+    level_after_purchase_text = translate_loyalty_level(
+        level_after_purchase,
+        language,
+    )
+    next_level_after_text = translate_loyalty_level(
+        next_level_after,
+        language,
+    )
     points_to_next_after = after.get(
         "points_to_next_level",
         0,
@@ -252,17 +323,17 @@ def build_loyalty_message_text(
         if reaches_new_level:
             return (
                 f"L’achat de {product_name} vous rapporte {reward} points "
-                f"et vous permet d’atteindre le niveau {level_after_purchase}. "
+                f"et vous permet d’atteindre le niveau {level_after_purchase_text}. "
                 f"Après l’achat, vous aurez {points_after_purchase} points "
                 f"et il vous manquera {points_to_next_after} points "
-                f"pour atteindre le niveau {next_level_after}."
+                f"pour atteindre le niveau {next_level_after_text}."
             )
 
         return (
             f"L’achat de {product_name} vous rapporte {reward} points. "
             f"Après l’achat, vous aurez {points_after_purchase} points "
             f"et il vous manquera {points_to_next_after} points "
-            f"pour atteindre le niveau {next_level_after}."
+            f"pour atteindre le niveau {next_level_after_text}."
         )
 
     # English
@@ -284,17 +355,17 @@ def build_loyalty_message_text(
         if reaches_new_level:
             return (
                 f"Buying {product_name} gives you {reward} points "
-                f"and moves you to {level_after_purchase}. "
+                f"and moves you to {level_after_purchase_text}. "
                 f"After the purchase, you will have {points_after_purchase} points "
                 f"and need {points_to_next_after} more points "
-                f"to reach {next_level_after}."
+                f"to reach {next_level_after_text}."
             )
 
         return (
             f"Buying {product_name} gives you {reward} points. "
             f"After the purchase, you will have {points_after_purchase} points "
             f"and need {points_to_next_after} more points "
-            f"to reach {next_level_after}."
+            f"to reach {next_level_after_text}."
         )
 
     # Tunisian Arabic
@@ -314,17 +385,17 @@ def build_loyalty_message_text(
     if reaches_new_level:
         return (
             f"شراء {product_name} يعطيك {reward} نقطة "
-            f"ويطلعك لمستوى {level_after_purchase}. "
+            f"ويطلعك لمستوى {level_after_purchase_text}. "
             f"بعد الشراء باش يكون عندك {points_after_purchase} نقطة، "
             f"ويبقالك {points_to_next_after} نقطة باش توصل "
-            f"لمستوى {next_level_after}."
+            f"لمستوى {next_level_after_text}."
         )
 
     return (
         f"استفد من عرض {product_name} واربح {reward} نقطة ولاء. "
         f"بعد الاستفادة من العرض باش يكون عندك {points_after_purchase} نقطة، "
         f"وباقيلك {points_to_next_after} نقطة فقط باش توصل "
-        f"لمستوى {next_level_after}."
+        f"لمستوى {next_level_after_text}."
     )
 
 def build_product_loyalty_message(
@@ -513,10 +584,22 @@ def generate_weekly_ai_summary(
     metrics: dict,
     language: str = "ar",
 ) -> str:
+    language = normalize_loyalty_language(language)
+
+    language_names = {
+        "en": "English",
+        "fr": "French",
+        "ar": "Arabic",
+    }
+
+    language_name = language_names[language]
+
     prompt = f"""
 Create a short personalized weekly wellness summary.
 
-Language: {language}
+STRICT OUTPUT LANGUAGE: {language_name}
+Write the entire response only in {language_name}.
+Do not mix Arabic, French, and English.
 
 Calculated metrics:
 {json.dumps(metrics, ensure_ascii=False)}
@@ -541,6 +624,7 @@ Rules:
                     {
                         "role": "system",
                         "content": (
+                            f"Respond only in {language_name}. "
                             "Use only the calculated "
                             "metrics supplied."
                         ),
@@ -561,14 +645,26 @@ Rules:
         )
 
     except Exception:
-        return (
-            "Your weekly summary is temporarily "
-            "unavailable."
-        )
-    
+        fallback_messages = {
+            "en": (
+                "Your weekly summary is temporarily "
+                "unavailable."
+            ),
+            "fr": (
+                "Votre résumé hebdomadaire est "
+                "temporairement indisponible."
+            ),
+            "ar": (
+                "ملخصك الأسبوعي غير متاح مؤقتًا."
+            ),
+        }
+
+        return fallback_messages[language]
+
 def build_graph_data(
     checkins: list[dict],
     weight_history: list[dict],
+    language: str = "ar",
 ) -> dict:
     return {
         "calories": [
@@ -651,6 +747,12 @@ def build_graph_data(
                 "trend": row.get(
                     "weight_trend"
                 ),
+                "trend_display": (
+                    translate_weight_trend(
+                        row.get("weight_trend"),
+                        language,
+                    )
+                ),
             }
             for row in checkins
         ],
@@ -660,6 +762,13 @@ def build_dashboard(
     user_code: str,
 ) -> dict:
     profile = get_user_profile(user_code)
+    print("DASHBOARD USER =", user_code)
+    print("DASHBOARD PROFILE =", profile)
+    print("DASHBOARD LANGUAGE =", profile.get("language"))
+
+    language = normalize_loyalty_language(
+        profile.get("language")
+    )
 
     current_week = get_last_days_checkins(
         user_code,
@@ -690,7 +799,7 @@ def build_dashboard(
     weekly_summary = (
         generate_weekly_ai_summary(
             weekly_metrics,
-            profile.get("language") or "ar",
+            language,
         )
     )
 
@@ -716,11 +825,32 @@ def build_dashboard(
             target_weight,
         )
     )
+
+    weight_progress["status_display"] = (
+        translate_weight_status(
+            weight_progress.get("status"),
+            language,
+        )
+    )
     loyalty_row = get_loyalty(user_code)
 
     loyalty_progress = (
         calculate_loyalty_progress(
             loyalty_row.get("points", 0)
+        )
+    )
+
+    loyalty_progress["current_level_display"] = (
+        translate_loyalty_level(
+            loyalty_progress.get("current_level"),
+            language,
+        )
+    )
+
+    loyalty_progress["next_level_display"] = (
+        translate_loyalty_level(
+            loyalty_progress.get("next_level"),
+            language,
         )
     )
 
@@ -735,6 +865,7 @@ def build_dashboard(
         "graphs": build_graph_data(
             current_week,
             weight_history,
+            language,
         ),
     }
 

@@ -2380,8 +2380,8 @@ def build_recommendation_agent_output(user_profile: dict):
         "average_steps_last_7_days": average_steps_last_7_days,
         "medical_conditions": user_profile.get("medical_conditions") or profile.get("medical_conditions", []),
         "language": normalize_language(
-            user_profile.get("language")
-            or profile.get("language")
+            profile.get("language")
+            or user_profile.get("language")
             or "ar"
         ),
         "sex": user_profile.get("sex") or profile.get("sex"),

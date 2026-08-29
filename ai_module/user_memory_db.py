@@ -726,17 +726,10 @@ def get_recent_checkins(user_code: str, limit: int = 50):
     return checkins
 
 def get_user_profile(user_code: str) -> dict:
-    user = get_or_create_user(user_code)
-
-    profile_id = user.get("profile_id")
-
-    if not profile_id:
-        return {}
-
     res = (
         supabase.table("user_profiles")
         .select("*")
-        .eq("id", profile_id)
+        .eq("id", user_code)
         .execute()
     )
 
@@ -744,7 +737,6 @@ def get_user_profile(user_code: str) -> dict:
         return res.data[0]
 
     return {}
-
 def upsert_user_profile(
     user_code: str,
     profile_data: dict,
