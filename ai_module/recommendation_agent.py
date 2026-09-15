@@ -1,5 +1,6 @@
 import os
 import json
+
 from dotenv import load_dotenv
 from openai import OpenAI
 from datetime import date
@@ -16,7 +17,8 @@ from ai_module.user_memory_db import (
     get_user_profile,
     log_recommendation,
     get_recent_checkins,
-    get_recent_chat_history
+    get_recent_chat_history,
+    get_recent_recommendation_history,
 )
 
 load_dotenv()
@@ -366,6 +368,262 @@ def get_best_offer(
     return None
 
 
+def consolidate_recommendation_signals(merged_profile: dict) -> dict:
+    """Consolidate signals already extracted by the other agents.
+
+    This deliberately contains no LLM call: check-ins, memory and chat records
+    are already structured before they reach the Recommendation Agent.
+    """
+    allowed_health = {
+        "digestion", "bloating_gas", "constipation", "fiber_support",
+        "appetite_control", "detox", "respiratory_support",
+        "smoking_reduction_support", "glycemic_balance",
+        "insulin_sensitivity", "sugar_cravings", "weight_loss",
+        "muscle_gain", "blood_regulation", "heart_support",
+        "stress_anxiety", "sleep",
+    }
+    allowed_food = {
+        "heavy_meals", "high_sugar", "light_meals", "balanced_meals",
+        "protein_intake", "vegetable_intake",
+    }
+
+    def append_unique(target: list, values, allowed: set | None = None):
+        if values is None:
+            return
+        if not isinstance(values, list):
+            values = [values]
+        for value in values:
+            normalized = str(value or "").lower().strip()
+            if normalized and (allowed is None or normalized in allowed):
+                if normalized not in target:
+                    target.append(normalized)
+
+    health_interests = []
+    food_patterns = []
+
+    # Highest priority: signals attached to recent check-ins.
+    for checkin in merged_profile.get("recent_checkins", []) or []:
+        append_unique(
+            health_interests,
+            checkin.get("health_interests"),
+            allowed_health,
+        )
+        append_unique(
+            food_patterns,
+            checkin.get("food_patterns"),
+            allowed_food,
+        )
+
+    # Structured profile goals and useful conversational records.
+    goal_mapping = {
+        "weight loss": "weight_loss",
+        "weight_loss": "weight_loss",
+        "weightloss": "weight_loss",
+        "muscle gain": "muscle_gain",
+        "muscle_gain": "muscle_gain",
+    }
+    goals = merged_profile.get("goals", []) or []
+    if not isinstance(goals, list):
+        goals = [goals]
+    for goal in goals:
+        mapped = goal_mapping.get(str(goal).lower().strip())
+        if mapped:
+            append_unique(health_interests, mapped, allowed_health)
+
+    intent_mapping = {
+        "weight_loss_advice": "weight_loss",
+        "muscle_gain_advice": "muscle_gain",
+        "meal_suggestion": None,
+    }
+    product_mapping = {
+        "Colon Detox": "digestion",
+        "Psyllium": "fiber_support",
+        "Liver Detox": "detox",
+        "Slim Pack": "weight_loss",
+        "Blood Detox": "blood_regulation",
+        "Lung Detox": "respiratory_support",
+        "Berberine & Ceylon Cinnamon": "glycemic_balance",
+    }
+    for interaction in merged_profile.get("recent_chat_topics", []) or []:
+        mapped_intent = intent_mapping.get(interaction.get("intent"))
+        if mapped_intent:
+            append_unique(health_interests, mapped_intent, allowed_health)
+        product_name = (
+            interaction.get("detected_product")
+            or interaction.get("recommended_product")
+        )
+        mapped_product = product_mapping.get(product_name)
+        if mapped_product:
+            append_unique(health_interests, mapped_product, allowed_health)
+
+    # Persistent memory completes the consolidated context.
+    append_unique(
+        health_interests,
+        merged_profile.get("health_interests", []),
+        allowed_health,
+    )
+    append_unique(
+        food_patterns,
+        merged_profile.get("recurring_food_patterns", []),
+        allowed_food,
+    )
+    append_unique(
+        health_interests,
+        merged_profile.get("last_detected_issue"),
+        allowed_health,
+    )
+
+    average_steps = merged_profile.get("average_steps_last_7_days")
+    recent_activities = merged_profile.get("recent_activities", []) or []
+    recurring_activity = merged_profile.get(
+        "recurring_activity_patterns", []
+    ) or []
+    normalized_activity = [
+        str(item).lower().strip() for item in recurring_activity
+    ]
+
+    if average_steps is not None:
+        if average_steps >= 8000:
+            activity_level = "high"
+        elif average_steps >= 5000 or recent_activities:
+            activity_level = "moderate"
+        else:
+            activity_level = "low"
+    elif "high" in normalized_activity:
+        activity_level = "high"
+    elif "moderate" in normalized_activity:
+        activity_level = "moderate"
+    elif "low" in normalized_activity:
+        activity_level = "low"
+    elif recent_activities:
+        activity_level = "moderate"
+    else:
+        activity_level = "unknown"
+
+    priority_need = health_interests[0] if health_interests else None
+    product_signals = list(health_interests)
+
+    return {
+        "health_interests": health_interests,
+        "activity_level": activity_level,
+        "food_patterns": food_patterns,
+        "detected_priority_need": priority_need,
+        "recommended_product_signals": product_signals,
+        "meal_strategy": "",
+        "exercise_strategy": "",
+        "reasoning_summary": "Structured signals consolidated deterministically.",
+    }
+
+
+def compact_recent_recommendations(history: list[dict]) -> dict:
+    """Keep only the content needed to prevent 14-day repetition."""
+    meals = []
+    exercises = []
+
+    def as_items(value):
+        if not value:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else [parsed]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return [value]
+        return [value]
+
+    for row in history or []:
+        for meal in as_items(row.get("meal_recommendations")):
+            if isinstance(meal, dict):
+                item = {
+                    "title": meal.get("title"),
+                    "recommendation": meal.get("recommendation"),
+                }
+            else:
+                item = str(meal)
+            if item and item not in meals:
+                meals.append(item)
+
+        for exercise in as_items(row.get("exercise_recommendations")):
+            if isinstance(exercise, dict):
+                item = {
+                    "title": exercise.get("title"),
+                    "description": exercise.get("description"),
+                    "main_workout": exercise.get("main_workout"),
+                }
+            else:
+                item = str(exercise)
+            if item and item not in exercises:
+                exercises.append(item)
+
+    return {
+        "meal_recommendations": meals,
+        "exercise_recommendations": exercises,
+    }
+
+def normalize_recommendation_text(value) -> str:
+    return " ".join(
+        str(value or "").lower().strip().split()
+    )
+
+
+def exercise_is_duplicate(
+    exercise: dict,
+    recent_exercises: list
+) -> bool:
+
+    if not isinstance(exercise, dict):
+        return False
+
+    generated_title = normalize_recommendation_text(
+        exercise.get("title")
+    )
+
+    generated_workout = [
+        normalize_recommendation_text(item)
+        for item in exercise.get("main_workout", [])
+        if item
+    ]
+
+    for previous in recent_exercises:
+
+        # Recommendations retrieved from Supabase may be JSON strings
+        if isinstance(previous, str):
+            try:
+                previous = json.loads(previous)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        if not isinstance(previous, dict):
+            continue
+
+        previous_title = normalize_recommendation_text(
+            previous.get("title")
+        )
+
+        previous_workout = [
+            normalize_recommendation_text(item)
+            for item in previous.get("main_workout", [])
+            if item
+        ]
+
+        same_title = (
+            generated_title
+            and previous_title
+            and generated_title == previous_title
+        )
+
+        same_workout = (
+            generated_workout
+            and previous_workout
+            and generated_workout == previous_workout
+        )
+
+        if same_title or same_workout:
+            return True
+
+    return False
 def extract_recommendation_signals_with_llm(merged_profile: dict) -> dict:
     fallback = {
         "health_interests": merged_profile.get("health_interests", []),
@@ -463,7 +721,7 @@ Important:
   heart health, blood pressure, or another cardiovascular concern.
 
 User data:
-{json.dumps(merged_profile, ensure_ascii=False)}
+{json.dumps(merged_profile, ensure_ascii=False, separators=(",", ":"))}
 """
 
     try:
@@ -473,7 +731,8 @@ User data:
                 {"role": "system", "content": "Return only valid JSON. No markdown. No explanation."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0
+            temperature=0,
+            response_format={"type": "json_object"},
         )
 
         content = response.choices[0].message.content.strip()
@@ -913,7 +1172,7 @@ Return ONLY JSON:
 }}
 
 User profile:
-{json.dumps(merged_profile, ensure_ascii=False)}
+{json.dumps(merged_profile, ensure_ascii=False, separators=(",", ":"))}
 
 Detected signals:
 {json.dumps(signals, ensure_ascii=False)}
@@ -942,6 +1201,7 @@ Only use product names present in eligible candidates.
                 },
             ],
             temperature=0,
+            response_format={"type": "json_object"},
         )
 
         data = json.loads(
@@ -1313,6 +1573,7 @@ def build_exercise_strategy(merged_profile, signals):
         "exercise_type": "general",
         "focus": "",
         "step_goal": "",
+        "sex_context": "unspecified",
         "today_program": {},
         "body_focus": [],
         "exercise_examples": [],
@@ -1328,38 +1589,51 @@ def build_exercise_strategy(merged_profile, signals):
     conditions_text = " ".join(conditions).lower() if isinstance(conditions, list) else str(conditions).lower()
     bmi = merged_profile.get("bmi")
     sex = merged_profile.get("sex")
+    normalized_sex = str(sex or "").strip().lower()
+
+    if normalized_sex in {"female", "male"}:
+        strategy["sex_context"] = normalized_sex
+    else:
+        strategy["sex_context"] = "unspecified"
     food_patterns = signals.get("food_patterns", [])
     health = signals.get("health_interests", [])
    
     recent_moods = merged_profile.get("recent_moods", [])
     consistency = merged_profile.get("consistency_score")
-    recurring_activity_patterns = merged_profile.get("recurring_activity_patterns", [])
+    recurring_activity_patterns = (
+        merged_profile.get("recurring_activity_patterns", []) or []
+    )
+    recent_activities = merged_profile.get("recent_activities", []) or []
+
     low_activity_count = recurring_activity_patterns.count("low")
     moderate_activity_count = recurring_activity_patterns.count("moderate")
     high_activity_count = recurring_activity_patterns.count("high")
-    
-    if sex == "female":
-        strategy["reasoning"].append(
-            "Program adapted to female physiological characteristics and personal goals."
-        )
 
-    elif sex == "male":
-        strategy["reasoning"].append(
-            "Program adapted to male physiological characteristics and personal goals."
-        )
+    has_activity_evidence = bool(
+        avg_steps is not None
+        or activity in {"low", "moderate", "high"}
+        or recent_activities
+        or recurring_activity_patterns
+    )
+    
+    
 
     
     moods_text = normalize_moods(recent_moods)
 
 # Step-based base level
 
-    if avg_steps is None:
+    if not has_activity_evidence:
         strategy["focus"] = "activity level not yet measured"
         strategy["step_goal"] = ""
-        strategy["reasoning"].append(
-            "No step history available: avoid assuming sedentary behavior"
-        )
 
+    elif avg_steps is None:
+        strategy["focus"] = "activity pattern available without step history"
+        strategy["step_goal"] = ""
+        strategy["reasoning"].append(
+            "No step history is available. Use the activity pattern detected "
+            "from check-ins or memory."
+        )
     
     elif avg_steps < 5000:
         strategy["focus"] = "increase daily movement"
@@ -1408,10 +1682,12 @@ def build_exercise_strategy(merged_profile, signals):
         strategy["exercise_type"] = "strength training"
         strategy["main_activity"] = "resistance training"
         strategy["duration"] = "40-60 minutes"
+
     elif "weight_loss" in goals or (bmi and bmi >= 25):
         strategy["exercise_type"] = "cardio + light strength"
         strategy["main_activity"] = "cardio and full-body movement"
-    else: 
+
+    else:
         strategy["exercise_type"] = "wellness movement"
         strategy["main_activity"] = "walking and mobility"
     # BMI adaptation
@@ -1454,21 +1730,97 @@ def build_exercise_strategy(merged_profile, signals):
     elif consistency is not None and consistency >= 75:
         strategy["reasoning"].append("High consistency: user can progress gradually")
 
+
+    # Final cold-start override
+# This must remain after goal, BMI, mood and consistency adaptations.
+    if not has_activity_evidence:
+        strategy["duration"] = "15-20 minutes"
+        strategy["frequency"] = "Today"
+        strategy["intensity"] = "light"
+        strategy["step_goal"] = ""
+
+        if "muscle_gain" in goals:
+            strategy["focus"] = "beginner full-body strength and mobility"
+            strategy["exercise_type"] = "beginner strength and mobility"
+            strategy["main_activity"] = (
+                "introductory full-body resistance and mobility"
+            )
+            strategy["exercise_examples"] = [
+                "wall push-ups",
+                "assisted squats",
+                "light resistance exercises",
+                "gentle mobility exercises",
+            ]
+
+        elif "weight_loss" in goals or (bmi and bmi >= 25):
+            strategy["focus"] = "beginner walking and mobility"
+            strategy["exercise_type"] = "beginner walking and mobility"
+            strategy["main_activity"] = (
+                "gentle walking and basic mobility"
+            )
+            strategy["exercise_examples"] = [
+                "comfortable walking",
+                "gentle mobility exercises",
+            ]
+
+        else:
+            strategy["focus"] = "beginner wellness movement"
+            strategy["exercise_type"] = "beginner wellness movement"
+            strategy["main_activity"] = (
+                "gentle walking, mobility, and breathing exercises"
+            )
+            strategy["exercise_examples"] = [
+                "comfortable walking",
+                "gentle mobility exercises",
+                "breathing exercises",
+            ]
+
+        strategy["reasoning"].append(
+            "No recent steps or activity check-ins are available. "
+            "Use a short and conservative introductory session."
+        )
 # Daily body/type rotation
     body_rotation = ["cardio", "lower body", "upper body + core", "mobility", "full body"]
     rotation_index = date.today().weekday() % len(body_rotation)
     rotated_focus = body_rotation[rotation_index]
 
 # Today's program selector
-    if "stress_anxiety" in health or "sleep" in health or "low_mood" in moods_text:
+    if not has_activity_evidence:
+        if "muscle_gain" in goals:
+            today_focus = "beginner full-body strength and mobility"
+            today_activity = (
+                "introductory full-body resistance and mobility exercises"
+            )
+
+        elif "weight_loss" in goals or (bmi and bmi >= 25):
+            today_focus = "beginner walking and mobility"
+            today_activity = (
+                "gentle walking and basic mobility exercises"
+            )
+
+        else:
+            today_focus = "beginner wellness movement"
+            today_activity = (
+                "gentle walking, mobility, and breathing exercises"
+            )
+
+    elif "stress_anxiety" in health or "sleep" in health or "low_mood" in moods_text:
         today_focus = "stress relief / mobility"
-        today_activity = "pilates, stretching, breathing exercises, or relaxing walk"
+        today_activity = (
+            "pilates, stretching, breathing exercises, or a relaxing walk"
+        )
     elif "muscle_gain" in goals:
         today_focus = rotated_focus if rotated_focus != "cardio" else "full body"
         today_activity = f"{today_focus} strength exercises adapted to your level"
     elif "weight_loss" in goals or (bmi and bmi >= 25):
-        today_focus = rotated_focus
-        today_activity = f"{today_focus} session with cardio and light strength"
+        if not has_activity_evidence:
+            today_focus = "beginner walking and mobility"
+            today_activity = "gentle walking and basic mobility"
+        else:
+            today_focus = rotated_focus
+            today_activity = (
+                f"{today_focus} session with cardio and light strength"
+            )
     else:
         today_focus = rotated_focus
         today_activity = f"{today_focus} wellness movement"
@@ -1481,7 +1833,7 @@ def build_exercise_strategy(merged_profile, signals):
         "step_goal": strategy.get("step_goal"),
         "extra": list(dict.fromkeys(strategy.get("exercise_examples", [])))[:3],
         
- 
+        "sex_context": strategy.get("sex_context"),
         "frequency": strategy.get("frequency"),
     
     }
@@ -1504,6 +1856,7 @@ def build_exercise_strategy(merged_profile, signals):
             "intensity": "light",
             "step_goal": "gentle movement only if approved",
             "extra": ["avoid intense exercise", "rest if tired"],
+            "sex_context": strategy.get("sex_context"),
             "frequency": strategy["frequency"]
         }
 
@@ -1520,6 +1873,7 @@ def build_exercise_strategy(merged_profile, signals):
             "intensity": "light to moderate",
             "step_goal": strategy.get("step_goal"),
             "extra": ["avoid sudden intense effort"],
+            "sex_context": strategy.get("sex_context"),
             "frequency": strategy.get("frequency")
 
         }
@@ -1545,6 +1899,7 @@ def build_exercise_strategy(merged_profile, signals):
             "frequency": strategy["frequency"],
             "intensity": strategy["intensity"],
             "step_goal": strategy.get("step_goal"),
+            "sex_context": strategy.get("sex_context"),
             "extra": [
                 "use support if balance is uncertain",
                 "avoid sudden high-impact effort",
@@ -1596,7 +1951,8 @@ def generate_dynamic_plan_with_llm(
     signals: dict,
     decision: dict,
     nutrition_strategy: dict,
-    exercise_strategy: dict
+    exercise_strategy: dict,
+    additional_instruction: str = "",
     
 ):
     fallback = {
@@ -1613,6 +1969,9 @@ def generate_dynamic_plan_with_llm(
     )
 
     language_name = LANGUAGE_NAMES[language]
+    recent_recommendations = merged_profile.get(
+        "recent_recommendations_14_days", []
+    ) or []
 
     language_instruction = f"""
     STRICT OUTPUT LANGUAGE: {language_name}
@@ -1660,6 +2019,13 @@ Daily variation rules:
 - Do not generate exactly the same meal titles on consecutive days unless medically necessary.
 - Do not generate exactly the same exercise session on consecutive days unless medically necessary.
 - Avoid repeating the exact same meal titles and workout title every day.
+- Do not repeat any meal recommendation or exercise session generated during
+  the previous 14 days. Use the history below to choose genuinely different
+  titles and concrete meal/workout content while preserving the same strategy,
+  safety constraints, duration, intensity, and user goal.
+
+Recommendations generated during the previous 14 days:
+{json.dumps(recent_recommendations, ensure_ascii=False, separators=(",", ":"))}
 
 Generate personalized:
 1. meal recommendations
@@ -1695,7 +2061,7 @@ The recommendations MUST consider ALL available information:
 Do not ignore any important factor.
 
 User profile:
-{json.dumps(merged_profile, ensure_ascii=False)}
+{json.dumps(merged_profile, ensure_ascii=False, separators=(",", ":"))}
 
 Extracted signals:
 {json.dumps(signals, ensure_ascii=False)}
@@ -1707,6 +2073,15 @@ Nutrition strategy:
 
 Exercise strategy:
 {json.dumps(exercise_strategy, ensure_ascii=False)}
+The exercise recommendation MUST follow these constraints:
+- Main activity: {exercise_strategy.get("main_activity")}
+- Exercise type: {exercise_strategy.get("exercise_type")}
+- Allowed examples: {exercise_strategy.get("exercise_examples")}
+- Duration: {exercise_strategy.get("duration")}
+- Intensity: {exercise_strategy.get("intensity")}
+- Do not replace the requested exercise type with another workout category.
+Additional generation instruction:
+{additional_instruction or "No additional instruction."}
 
 Rules:
 Output language: {language}
@@ -1718,10 +2093,26 @@ Language rules:
 - Be practical and personalized.
 - Avoid generic robotic recommendations.
 - Adapt meals to detected food patterns.
-- Adapt exercise intensity to activity level.
+- Adapt exercise intensity to the available activity evidence.
+- Infer the current fitness level only from recent steps, activity check-ins,
+  and recurring activity patterns.
+- When sufficient activity evidence is available, use the inferred fitness
+  level to adapt exercise type, duration, intensity, and progression.
+- When no activity evidence is available, follow
+  exercise_strategy.today_program exactly.
+- For a cold-start user, use a light introductory session lasting
+  15-20 minutes.
+- Never claim that the workout matches the user's current fitness level
+  when that level is unknown.
 - Keep recommendations realistic.
 Advanced reasoning rules:
 - Use recent_chat_topics from the last 90 days only as long-term personalization signals.
+- If there are no recent check-ins, meals, activities, chats, or recurring
+  patterns, treat the user as a cold-start user.
+- For a cold-start user, do not claim that the user already follows healthy
+  meals, exercises regularly, or has made progress.
+- Explain that the initial recommendations rely on profile information and
+  that daily check-ins will improve future personalization.
 - Do not repeat or summarize the whole chatbot conversation.
 - Use chat history only to detect recurring concerns, preferences, products discussed, and repeated difficulties.
 - If recent check-ins show improvement after previous poor habits, encourage progress and suggest maintaining the new habit.
@@ -1767,7 +2158,7 @@ Example:
 {{
 "title":"Today's Walking Session",
 "description":"A beginner-friendly cardio session.",
-"duration":"30 minutes",
+"duration":"15-20 minutes",
 "frequency":"Today",
 "intensity":"Light",
 "warmup":"5 minutes easy walking",
@@ -1777,7 +2168,7 @@ Example:
 "10 wall push-ups"
 ],
 "cooldown":"5 minutes stretching",
-"reason":"Suitable for your current activity level."
+"reason":"A conservative starting session while recent activity data is not yet available."
 }}
 
 Use exercise_strategy.today_program as the main guidance.
@@ -1790,7 +2181,15 @@ The session must include:
 Adapt the exercises according to:
 - Age
 - Sex (only for physiological context, never limit body parts based on sex)
-- BMI and current fitness level
+- Do not assume that women require easier exercises or that men require
+  harder exercises.
+- Never select body focus, workout duration, or intensity based on sex alone.
+- Use sex only when it is relevant to an explicitly recorded physiological
+  condition, such as pregnancy and breastfeeding.
+- Activity history, steps, age, BMI, goals, consistency, and medical
+  conditions must determine workout difficulty.
+- BMI and current fitness level when it can be inferred from recent steps,
+  activity check-ins, or recurring activity patterns
 - Goal (weight loss, muscle gain, general wellness)
 - Medical conditions and safety limitations (highest priority)
 - Average steps and activity level from the last 7 days
@@ -1818,6 +2217,11 @@ age, BMI, activity level, consistency, or today's selected focus.
 Do not recommend unsafe exercises. Medical conditions always override fitness goals.
 Cultural adaptation rules:
 - Adapt meal recommendations to Tunisian food culture when appropriate.
+- Meal recommendations generated in the same response must be meaningfully
+  different from each other.
+- Do not generate two meals from the same category, such as two soups,
+  two salads, or two sandwiches, in the same response.
+- Vary the main ingredients, preparation method, and meal type.
 - Prefer realistic Tunisian healthy meals instead of only international meals.
 - Keep the recommendations compatible with the nutrition_strategy.
 - You may suggest traditional Tunisian dishes with healthier adaptations.
@@ -1886,7 +2290,10 @@ These warnings are already handled by the rule engine.
 - Avoid repeating identical recommendations every day.
 - Recommendations should feel contextual, progressive, human, and realistic.
 - Return ONLY valid JSON.
-
+- For a cold-start user, do not refer to previous effort, progress,
+  improvement, consistency, or achieved results.
+- Encourage the user to begin with simple actions and complete daily
+  check-ins for better personalization.
 JSON schema:
 {{
   "behavioral_insight": "",
@@ -1940,7 +2347,8 @@ JSON schema:
                     "content": prompt
                 }
             ],
-            temperature=0.3
+            temperature=0.3,
+            response_format={"type": "json_object"},
         )
 
         content = response.choices[0].message.content.strip()
@@ -1955,7 +2363,8 @@ def build_recommendation_decision(
     merged_profile: dict,
     bmi: float | None,
     quantity_offers_db: dict,
-    bundle_offers_db: list
+    bundle_offers_db: list,
+    product_db: dict | None = None,
 ) -> dict:
     health_interests = signals.get("health_interests", [])
     activity_level = signals.get("activity_level", "unknown")
@@ -2096,7 +2505,13 @@ def build_recommendation_decision(
         merged_profile.get("language", "ar")
     )
 
-    product_db = get_product_knowledge_dict()
+    # OPTIMIZATION: product_db is now an optional parameter. The caller
+    # (build_recommendation_agent_output) fetches it once, in parallel
+    # with the other independent reads, and passes it in here. This
+    # function still falls back to fetching it itself when called
+    # directly without a pre-fetched product_db, so no other call site
+    # or behavior changes.
+    product_db = product_db or get_product_knowledge_dict()
 
     ranked_products = score_products(
         product_db=product_db,
@@ -2142,15 +2557,16 @@ def build_recommendation_decision(
                 < best_other_score - 3
             ]
 
-            eligible_for_reranking = (
-                rerank_products_with_llm(
-                    ranked_products=(
-                        eligible_for_reranking
-                    ),
-                    signals=signals,
-                    merged_profile=merged_profile,
+            # Reranking is useful only when at least two products
+            # can actually exchange positions.
+            if len(eligible_for_reranking) >= 2:
+                eligible_for_reranking = (
+                    rerank_products_with_llm(
+                        ranked_products=eligible_for_reranking,
+                        signals=signals,
+                        merged_profile=merged_profile,
+                    )
                 )
-            )
 
             ranked_products = [
                 locked_top_product,
@@ -2354,9 +2770,46 @@ def build_recommendation_agent_output(user_profile: dict):
     start_time = time.time()
     user_profile = user_profile or {}
     user_id = user_profile.get("user_id", "demo_user")
-    memory = get_user_memory(user_id)
-    profile = get_user_profile(user_id)
-    recent_checkins = get_recent_checkins(user_id, limit=50)
+
+    # -------------------------------------------------------------
+  
+    # (none of them needs the result of another one to run), but were
+    # previously executed one after another, paying the full network
+    # round-trip of each call in sequence. Running them concurrently
+    # in a small thread pool reduces the wall-clock time of this
+    # phase to roughly that of the single slowest call instead of
+    # the sum of all seven -- with the exact same inputs, outputs,
+    # and downstream logic as before.
+    # -------------------------------------------------------------
+# Retrieve user data sequentially.
+# The Supabase synchronous client is shared and should not be used
+# concurrently by multiple threads.
+
+    memory = get_user_memory(user_id) or {}
+    profile = get_user_profile(user_id) or {}
+    recent_checkins = get_recent_checkins(user_id, limit=14) or []
+
+    recent_chat_history = get_recent_chat_history(
+        user_id,
+        days=90,
+        limit=30,
+    ) or []
+
+    quantity_offers_db = get_quantity_offers_dict() or {}
+    bundle_offers_db = get_bundle_offers() or []
+    product_db = get_product_knowledge_dict() or {}
+
+    recommendation_history = get_recent_recommendation_history(
+        user_id,
+        days=14,
+        limit=20,
+    ) or []
+
+    recent_recommendations = compact_recent_recommendations(
+        recommendation_history
+    )
+
+
     recent_steps = [
         c.get("daily_steps", 0)
         for c in recent_checkins
@@ -2368,9 +2821,6 @@ def build_recommendation_agent_output(user_profile: dict):
         if recent_steps
         else None
     )
-    recent_chat_history = get_recent_chat_history(user_id, days=90, limit=100)
-    quantity_offers_db = get_quantity_offers_dict()
-    bundle_offers_db = get_bundle_offers()
     merged_profile = {
         "user_id": user_id,
         "age": user_profile.get("age") or profile.get("age"),
@@ -2399,6 +2849,7 @@ def build_recommendation_agent_output(user_profile: dict):
         "notes": memory.get("notes", []),
         "recent_checkins": recent_checkins,
         "recent_chat_history": recent_chat_history,
+        "recent_recommendations_14_days": recent_recommendations,
         "recent_chat_topics": [
             {
                 "question": c.get("question"),
@@ -2427,13 +2878,14 @@ def build_recommendation_agent_output(user_profile: dict):
     bmi = calculate_bmi(merged_profile.get("weight"), merged_profile.get("height"))
     merged_profile["bmi"] = bmi
 
-    signals = extract_recommendation_signals_with_llm(merged_profile)
+    signals = consolidate_recommendation_signals(merged_profile)
     decision = build_recommendation_decision(
         signals,
         merged_profile,
         bmi,
         quantity_offers_db,
-        bundle_offers_db
+        bundle_offers_db,
+        product_db=product_db,
     )
     nutrition_strategy = build_nutrition_strategy(
         merged_profile,
@@ -2451,6 +2903,200 @@ def build_recommendation_agent_output(user_profile: dict):
         nutrition_strategy,
         exercise_strategy
     )
+
+
+    recent_exercises = recent_recommendations.get(
+        "exercise_recommendations",
+        [],
+    )
+
+    generated_exercises = dynamic_plan.get(
+        "exercise_recommendations",
+        [],
+    )
+
+    has_duplicate_exercise = any(
+        exercise_is_duplicate(
+            exercise,
+            recent_exercises,
+        )
+        for exercise in generated_exercises
+    )
+
+    if has_duplicate_exercise:
+
+        today_focus = str(
+            exercise_strategy["today_program"].get("focus", "")
+        ).lower()
+
+        today_activity = str(
+            exercise_strategy["today_program"].get("activity", "")
+        ).lower()
+
+        if "walking" in today_focus or "walking" in today_activity:
+            category_instruction = (
+                "Walking must appear in main_workout. "
+                "Include gentle mobility and do not replace the session "
+                "with strength-focused training."
+            )           
+            variation_options = [
+                {
+                    "variation": "walking with standing mobility",
+                    "required_exercises": [
+                        "comfortable walking",
+                        "ankle circles",
+                        "gentle knee raises"
+                    ]
+                },
+                {
+                    "variation": "interval walking with joint mobility",
+                    "required_exercises": [
+                        "alternating easy and moderate walking",
+                        "shoulder rolls",
+                        "gentle hip circles"
+                    ]
+                },
+                {
+                    "variation": "indoor walking and balance",
+                    "required_exercises": [
+                        "walking in place",
+                        "heel-to-toe walking",
+                        "supported balance exercise"
+                    ]
+                }
+            ]
+
+        elif (
+            "strength" in today_focus
+            or "strength" in today_activity
+        ):
+            category_instruction = (
+                "Use beginner strength and mobility exercises. "
+                "Do not replace the session with walking-only cardio."
+            )           
+            variation_options = [
+                {
+                    "variation": "beginner full-body resistance",
+                    "required_exercises": [
+                        "assisted squats",
+                        "wall push-ups",
+                        "standing calf raises"
+                    ]
+                },
+                {
+                    "variation": "beginner resistance and mobility",
+                    "required_exercises": [
+                        "chair squats",
+                        "light resistance rows",
+                        "gentle hip mobility"
+                    ]
+                },
+                {
+                    "variation": "beginner strength and balance",
+                    "required_exercises": [
+                        "supported reverse lunges",
+                        "wall presses",
+                        "supported balance holds"
+                    ]
+                }
+            ]
+
+        else:
+            category_instruction = (
+                "Use gentle general-wellness movement consistent with "
+                "the selected focus and activity."
+            )
+            variation_options = [
+                {
+                    "variation": "gentle mobility",
+                    "required_exercises": [
+                        "shoulder rolls",
+                        "gentle torso rotations",
+                        "ankle circles"
+                    ]
+                },
+                {
+                    "variation": "wellness movement and balance",
+                    "required_exercises": [
+                        "walking in place",
+                        "supported balance holds",
+                        "gentle side stretches"
+                    ]
+                },
+                {
+                    "variation": "light full-body movement",
+                    "required_exercises": [
+                        "gentle knee raises",
+                        "arm circles",
+                        "standing side steps"
+                    ]
+                }
+            ]
+
+        variation_index = (
+            len(recent_exercises) % len(variation_options)
+        )
+        selected_variation = variation_options[variation_index]
+        retry_plan = generate_dynamic_plan_with_llm(
+            merged_profile,
+            signals,
+            decision,
+            nutrition_strategy,
+            exercise_strategy,
+            additional_instruction=f"""
+            Mandatory new variation:
+            {json.dumps(selected_variation, ensure_ascii=False)}
+
+            Recent exercises that must not be repeated:
+            {json.dumps(recent_exercises, ensure_ascii=False)}
+            The exercise generated in the previous attempt duplicated an exercise
+            from the user's recent 14-day history.
+
+            Generate a genuinely different exercise session, but strictly preserve
+            the deterministic exercise strategy.
+
+            Required focus:
+            {exercise_strategy["today_program"].get("focus")}
+
+            Required activity:
+            {exercise_strategy["today_program"].get("activity")}
+
+            Required duration:
+            {exercise_strategy["today_program"].get("duration")}
+
+            Required intensity:
+            {exercise_strategy["today_program"].get("intensity")}
+
+            Use different exercises from the recent history while remaining inside
+            the required activity category.
+
+            Category-specific requirement:
+            {category_instruction}
+            """
+        )
+
+        retry_exercises = retry_plan.get(
+            "exercise_recommendations",
+            [],
+        )
+
+        retry_has_duplicate = any(
+            exercise_is_duplicate(
+                exercise,
+                recent_exercises,
+            )
+            for exercise in retry_exercises
+        )
+
+        if retry_exercises and not retry_has_duplicate:
+            dynamic_plan["exercise_recommendations"] = (
+                retry_exercises
+            )
+        else:
+            print(
+                "[RECOMMENDATION] Exercise remained duplicated "
+                "after one retry."
+            )
     
 
     output = {

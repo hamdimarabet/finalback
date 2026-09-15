@@ -81,6 +81,31 @@ def get_recent_chat_history(user_code: str, days: int = 90, limit: int = 100):
 
     return res.data or []
 
+
+def get_recent_recommendation_history(
+    user_code: str,
+    days: int = 14,
+    limit: int = 50,
+):
+    """Return recent generated recommendations for repetition prevention."""
+    user = get_or_create_user(user_code)
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    result = (
+        supabase.table("recommendation_logs")
+        .select(
+            "recommended_products,meal_recommendations,"
+            "exercise_recommendations,created_at"
+        )
+        .eq("user_id", user["id"])
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    return result.data or []
+
 def merge_unique(existing, new_items):
     existing = existing or []
 
@@ -705,23 +730,42 @@ def get_recent_checkins(user_code: str, limit: int = 50):
 
     checkins = checkins_res.data or []
 
+    if not checkins:
+        return []
+
+    # Preserve all records while replacing the former N+1 query pattern with
+    # two grouped child-table queries.
+    checkin_ids = [checkin["id"] for checkin in checkins]
+
+    meals_res = (
+        supabase.table("daily_meal_logs")
+        .select("*")
+        .in_("checkin_id", checkin_ids)
+        .execute()
+    )
+    activities_res = (
+        supabase.table("daily_activity_logs")
+        .select("*")
+        .in_("checkin_id", checkin_ids)
+        .execute()
+    )
+
+    meals_by_checkin = {checkin_id: [] for checkin_id in checkin_ids}
+    for meal in meals_res.data or []:
+        meals_by_checkin.setdefault(meal.get("checkin_id"), []).append(meal)
+
+    activities_by_checkin = {checkin_id: [] for checkin_id in checkin_ids}
+    for activity in activities_res.data or []:
+        activities_by_checkin.setdefault(
+            activity.get("checkin_id"), []
+        ).append(activity)
+
     for checkin in checkins:
-        meals_res = (
-            supabase.table("daily_meal_logs")
-            .select("*")
-            .eq("checkin_id", checkin["id"])
-            .execute()
+        checkin_id = checkin["id"]
+        checkin["daily_meal_logs"] = meals_by_checkin.get(checkin_id, [])
+        checkin["daily_activity_logs"] = activities_by_checkin.get(
+            checkin_id, []
         )
-
-        activities_res = (
-            supabase.table("daily_activity_logs")
-            .select("*")
-            .eq("checkin_id", checkin["id"])
-            .execute()
-        )
-
-        checkin["daily_meal_logs"] = meals_res.data or []
-        checkin["daily_activity_logs"] = activities_res.data or []
 
     return checkins
 
